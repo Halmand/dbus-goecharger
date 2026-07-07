@@ -113,7 +113,7 @@ class DbusGoeChargerService:
     accessType = config['DEFAULT']['AccessType']
     
     if accessType == 'OnPremise': 
-      URL = "http://%s/api/status" % (config['ONPREMISE']['Host'])
+      URL = "http://%s/status" % (config['ONPREMISE']['Host'])
     else:
       raise ValueError("AccessType %s is not supported" % (config['DEFAULT']['AccessType']))
     

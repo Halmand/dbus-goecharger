@@ -1,300 +1,323 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# import normal packages
 import platform
 import logging
 from logging.handlers import RotatingFileHandler
-import sys
 import os
+import sys
 import time
-import requests  # for http GET
-import configparser  # for config/ini file
+import requests
+import threading
 
-if sys.version_info.major == 2:
-    import gobject
-else:
-    from gi.repository import GLib as gobject
-
-# our own packages from victron
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
+sys.path.insert(1, os.path.join(os.path.dirname(__file__),
+                                '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python'))
 from vedbus import VeDbusService
 
+# Formatierungsfunktionen für dbus
+_kwh = lambda p, v: f"{v:.2f}kWh"
+_a   = lambda p, v: f"{v:.1f}A"
+_w   = lambda p, v: f"{v:.1f}W"
+_v   = lambda p, v: f"{v:.1f}V"
+_degC= lambda p, v: f"{v}°C"
+_s   = lambda p, v: f"{v}s"
 
 class DbusGoeChargerService:
-    def __init__(self, servicename, paths, productname='go-eCharger', connection='go-eCharger HTTP JSON service'):
-        config = self._getConfig()
-        deviceinstance = int(config['DEFAULT']['Deviceinstance'])
-        hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
-        acPosition = int(config['DEFAULT']['AcPosition'])
-        pauseBetweenRequests = int(config['ONPREMISE']['PauseBetweenRequests'])
-
-        if pauseBetweenRequests <= 20:
-            raise ValueError("Pause between requests must be greater than 20")
-
-        self._dbusservice = VeDbusService("{}.http_{:02d}".format(servicename, deviceinstance), register=False)
+    def __init__(self, servicename, deviceinstance, paths=None,
+                 productname='go-eCharger', connection='HTTP JSON',
+                 voltage_mult=1.0, voltage_off=0.0,
+                 current_mult=1.0, current_off=0.0,
+                 power_mult=1.0, power_off=0.0,
+                 energy_mult=1.0, energy_off=0.0):
+        self._dbusservice = VeDbusService(servicename)
         self._paths = paths
 
-        # Create the mandatory objects
-        self._dbusservice.add_path('/ProductId', 0xFFFF)
+        # Kalibrierungsparameter speichern
+        self._voltage_mult = voltage_mult
+        self._voltage_off = voltage_off
+        self._current_mult = current_mult
+        self._current_off = current_off
+        self._power_mult = power_mult
+        self._power_off = power_off
+        self._energy_mult = energy_mult
+        self._energy_off = energy_off
+
+        logging.debug("%s /DeviceInstance = %d", servicename, deviceinstance)
+
+        # Management
+        self._dbusservice.add_path('/Mgmt/ProcessName', __file__)
+        self._dbusservice.add_path('/Mgmt/ProcessVersion',
+                                   '1.3.1 (Python ' + platform.python_version() + ')')
+        self._dbusservice.add_path('/Mgmt/Connection', connection)
+
+        # Pflichtobjekte
+        self._dbusservice.add_path('/DeviceInstance', deviceinstance)
+        self._dbusservice.add_path('/ProductId', 65535)
+        self._dbusservice.add_path('/ProductName', productname)
+        self._dbusservice.add_path('/FirmwareVersion', '1.0.0')
+        self._dbusservice.add_path('/HardwareVersion', 0)
         self._dbusservice.add_path('/Connected', 1)
+
         self._dbusservice.add_path('/UpdateIndex', 0)
-        self._dbusservice.add_path('/Position', acPosition)
+        self._dbusservice.add_path('/Position', 1)
 
-        # add path values to dbus
-        for path, settings in self._paths.items():
-            self._dbusservice.add_path(path, settings['initial'], gettextcallback=settings['textformat'])
+        # Ladeparameter
+        self._dbusservice.add_path('/Current', None, gettextcallback=_a)
+        self._dbusservice.add_path('/MaxCurrent', None, gettextcallback=_a, writeable=True)
+        self._dbusservice.add_path('/SetCurrent', None, gettextcallback=_a, writeable=True)
 
-        # register the service
-        self._dbusservice.register()
+        # Hauptmesswerte
+        self._dbusservice.add_path('/Power', None, gettextcallback=_w)
+        self._dbusservice.add_path('/Ac/Power', None, gettextcallback=_w)
+        self._dbusservice.add_path('/Voltage', None, gettextcallback=_v)
+        self._dbusservice.add_path('/Ac/Voltage', None, gettextcallback=_v)
+        self._dbusservice.add_path('/Energy/Forward', None, gettextcallback=_kwh)
+        self._dbusservice.add_path('/Ac/Energy/Forward', None, gettextcallback=_kwh)
 
-        # last update
+        # Phasen
+        self._dbusservice.add_path('/L1/Voltage', None, gettextcallback=_v)
+        self._dbusservice.add_path('/L2/Voltage', None, gettextcallback=_v)
+        self._dbusservice.add_path('/L3/Voltage', None, gettextcallback=_v)
+        self._dbusservice.add_path('/L1/Current', None, gettextcallback=_a)
+        self._dbusservice.add_path('/L2/Current', None, gettextcallback=_a)
+        self._dbusservice.add_path('/L3/Current', None, gettextcallback=_a)
+        self._dbusservice.add_path('/L1/Power', None, gettextcallback=_w)
+        self._dbusservice.add_path('/L2/Power', None, gettextcallback=_w)
+        self._dbusservice.add_path('/L3/Power', None, gettextcallback=_w)
+
+        # Status und Ladezeit
+        self._dbusservice.add_path('/Status', 0)
+        self._dbusservice.add_path('/ChargingTime', 0, gettextcallback=_s)
+
+        # Lademodus (optional)
+        self._dbusservice.add_path('/ChargeMode', 0, writeable=True)
+
         self._lastUpdate = 0
-
-        # charging time in float
-        self._chargingTime = 0.0
-
-        # add _update function 'timer'
-        gobject.timeout_add(pauseBetweenRequests, self._update)
-
-    def _getConfig(self):
-        config = configparser.ConfigParser()
-        config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
-        return config
-
-    def _getSignOfLifeInterval(self):
-        config = self._getConfig()
-        value = config['DEFAULT'].get('SignOfLifeLog', '0')
-        if not value:
-            value = 0
-        return int(value)
-
-    def _getGoeChargerStatusUrl(self):
-        config = self._getConfig()
-        accessType = config['DEFAULT']['AccessType']
-        host = config['ONPREMISE']['Host']
-        if accessType == 'OnPremise':
-            URL = "http://%s/status" % host
-        else:
-            URL = "http://%s/status" % host
-        return URL
-
-    def _getGoeChargerData(self, filter=None):
-        try:
-            url = self._getGoeChargerStatusUrl()
-            if filter:
-                url += "?filter=" + filter
-            request_data = requests.get(url=url, timeout=10)
-
-            if not request_data:
-                return None
-
-            json_data = request_data.json()
-
-            if not json_data:
-                return None
-
-            return json_data
-
-        except Exception as e:
-            logging.warning("Error fetching go-eCharger data: %s", e)
-            return None
-
-    def _setGoeChargerValue(self, parameter, value):
-        config = self._getConfig()
-        accessType = config['DEFAULT']['AccessType']
-        host = config['ONPREMISE']['Host']
-
-        if accessType == 'OnPremise':
-            URL = "http://%s/status" % host
-        else:
-            URL = "http://%s/status" % host
+        self._updateIndex = 0
+        self._chargingTime = 0
 
         try:
-            request_data = requests.get(url=URL, timeout=10)
-            if not request_data:
-                return False
-            json_data = request_data.json()
-            if not json_data:
-                return False
-            if json_data.get(parameter) == str(value):
-                return True
-            else:
-                return False
-        except Exception as e:
-            logging.warning("Error setting go-eCharger value: %s", e)
-            return False
-
-    def _update(self):
-        try:
-            # get data from go-eCharger
             data = self._getGoeChargerData()
-
-            if data is not None:
-                config = self._getConfig()
-
-                # --- Calibration offsets & multipliers ---
-                voltageOffset = float(config['ONPREMISE'].get('VoltageOffset', 0))
-                voltageMultiplier = float(config['ONPREMISE'].get('VoltageMultiplier', 1.0))
-                currentOffset = float(config['ONPREMISE'].get('CurrentOffset', 0))
-                currentMultiplier = float(config['ONPREMISE'].get('CurrentMultiplier', 1.0))
-                powerOffset = float(config['ONPREMISE'].get('PowerOffset', 0))
-                powerMultiplier = float(config['ONPREMISE'].get('PowerMultiplier', 1.0))
-
-                hardwareVersion = int(config['DEFAULT']['HardwareVersion'])
-
-                '''
-                data['nrg'] - Firmware 42.0 API v1 units:
-                0  = U L1  (Volts, direct)
-                1  = U L2  (Volts, direct)
-                2  = U L3  (Volts, direct)
-                3  = U N   (Volts, direct)
-                4  = I L1  (0.1 A)   -> divide by 10
-                5  = I L2  (0.1 A)   -> divide by 10
-                6  = I L3  (0.1 A)   -> divide by 10
-                7  = P L1  (0.1 kW)  -> multiply by 100 = Watts
-                8  = P L2  (0.1 kW)  -> multiply by 100 = Watts
-                9  = P L3  (0.1 kW)  -> multiply by 100 = Watts
-                10 = P N   (0.1 kW)
-                11 = P tot (0.01 kW) -> multiply by 10 = Watts
-                12 = PF L1 (%)
-                13 = PF L2 (%)
-                14 = PF L3 (%)
-                15 = PF N  (%)
-                '''
-
-                # --- Voltage (direct in Volts) ---
-                voltage_raw = int(data['nrg'][0])
-                self._dbusservice['/Ac/Voltage'] = int(round(voltage_raw * voltageMultiplier + voltageOffset))
-
-                # --- Current (0.1 A -> A) ---
-                current_raw = max(data['nrg'][4], data['nrg'][5], data['nrg'][6]) / 10.0
-                current_cal = current_raw * currentMultiplier + currentOffset
-                self._dbusservice['/Current'] = round(current_cal, 1)
-
-                # --- Power per phase (0.1 kW -> W) ---
-                power_l1_raw = int(data['nrg'][7] * 100)
-                power_l2_raw = int(data['nrg'][8] * 100)
-                power_l3_raw = int(data['nrg'][9] * 100)
-                self._dbusservice['/Ac/L1/Power'] = int(round(power_l1_raw * powerMultiplier + powerOffset))
-                self._dbusservice['/Ac/L2/Power'] = int(round(power_l2_raw * powerMultiplier + powerOffset))
-                self._dbusservice['/Ac/L3/Power'] = int(round(power_l3_raw * powerMultiplier + powerOffset))
-
-                # --- Total Power (0.01 kW -> W) ---
-                power_total_raw = int(data['nrg'][11] * 10)
-                self._dbusservice['/Ac/Power'] = int(round(power_total_raw * powerMultiplier + powerOffset))
-
-                # --- Energy ---
-                energyTotal = int(data['dws']) / 1000.0 / 60.0 / 60.0  # dws is 0.001 kWh
-                self._dbusservice['/Ac/Energy/Forward'] = round(energyTotal, 2)
-
-                # --- Charging time ---
-                timeDelta = time.time() - self._lastUpdate
-                if powerTotal_raw > 10:
-                    self._chargingTime += timeDelta
-                else:
-                    self._chargingTime = 0
-
-                if hardwareVersion >= 3:
-                    self._dbusservice['/ChargingTime'] = int(self._chargingTime)
-                else:
-                    self._dbusservice['/ChargingTime'] = int(self._chargingTime)
-
-                # --- Status ---
-                status = 0
-                car = int(data['car'])
-                if car == 1:
-                    status = 0  # Not ready
-                elif car == 2:
-                    status = 2  # Charging
-                elif car == 3:
-                    status = 6  # Car unplugged / ready
-                elif car == 4:
-                    status = 3  # Error
-                self._dbusservice['/Status'] = status
-
-                # --- UpdateIndex ---
-                index = self._dbusservice['/UpdateIndex'] + 1
-                if index > 255:
-                    index = 0
-                self._dbusservice['/UpdateIndex'] = index
-
-                # update lastupdate
-                self._lastUpdate = time.time()
-
-            else:
-                logging.debug("Wallbox is not available")
-
+            self._updateValues(data)
         except Exception as e:
-            logging.warning("Error in _update: %s", e)
+            logging.warning(f"Initialer Datenabruf fehlgeschlagen: {e}")
 
+        self._goe_thread = threading.Thread(target=self._workerThread)
+        self._goe_thread.daemon = True
+        self._goe_thread.start()
+
+    def _getIP(self):
+        configFile = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'config.ini')
+        if os.path.exists(configFile):
+            import configparser
+            config = configparser.ConfigParser()
+            config.read(configFile)
+            if 'ONPREMISE' in config:
+                return config['ONPREMISE'].get('Host', '192.168.1.222')
+        return '192.168.1.222'
+
+    def _getGoeChargerData(self):
+        ip = self._getIP()
+        url = f"http://{ip}/status"
+        try:
+            r = requests.get(url, timeout=3)
+            r.raise_for_status()
+            data = r.json()
+            return data
+        except Exception as e:
+            logging.warning(f"Fehler beim Abruf von {url}: {e}")
+            return {}
+
+    def _fetch_and_update(self):
+        try:
+            data = self._getGoeChargerData()
+            if data:
+                self._updateValues(data)
+                self._updateIndex += 1
+                self._dbusservice['/UpdateIndex'] = self._updateIndex
+                self._lastUpdate = time.time()
+            else:
+                logging.info("Keine Daten empfangen, versuche erneut")
+        except Exception as e:
+            logging.error(f"Fehler im Update-Zyklus: {e}")
+
+    def _updateValues(self, data):
+        # Konvertiere alle String-Werte in Zahlen (die API liefert Strings)
+        def _int(key, default=0):
+            return int(data.get(key, default))
+        def _float(key, default=0.0):
+            return float(data.get(key, default))
+
+        nrg = data.get('nrg', [])
+
+        # Spannungen (V) – mit Kalibrierung
+        u1 = (float(nrg[0]) * self._voltage_mult + self._voltage_off) if len(nrg) > 0 else 0.0
+        u2 = (float(nrg[1]) * self._voltage_mult + self._voltage_off) if len(nrg) > 1 else 0.0
+        u3 = (float(nrg[2]) * self._voltage_mult + self._voltage_off) if len(nrg) > 2 else 0.0
+        self._dbusservice['/L1/Voltage'] = u1
+        self._dbusservice['/L2/Voltage'] = u2
+        self._dbusservice['/L3/Voltage'] = u3
+        self._dbusservice['/Voltage'] = u1
+        self._dbusservice['/Ac/Voltage'] = u1
+
+        # Ströme (A) – in 0.1A, mit Kalibrierung
+        i1_raw = float(nrg[6]) if len(nrg) > 6 else 0.0
+        i2_raw = float(nrg[4]) if len(nrg) > 4 else 0.0
+        i3_raw = float(nrg[5]) if len(nrg) > 5 else 0.0
+        i1 = round((i1_raw * 0.1) * self._current_mult + self._current_off, 1)
+        i2 = round((i2_raw * 0.1) * self._current_mult + self._current_off, 1)
+        i3 = round((i3_raw * 0.1) * self._current_mult + self._current_off, 1)
+        self._dbusservice['/L1/Current'] = i1
+        self._dbusservice['/L2/Current'] = i2
+        self._dbusservice['/L3/Current'] = i3
+        self._dbusservice['/Current'] = i1
+
+        # Leistungen (W) – in 0.1kW, mit Kalibrierung
+        p1_raw = float(nrg[9]) if len(nrg) > 9 else 0.0
+        p2_raw = float(nrg[7]) if len(nrg) > 7 else 0.0
+        p3_raw = float(nrg[8]) if len(nrg) > 8 else 0.0
+        p1 = round((p1_raw * 100) * self._power_mult + self._power_off)
+        p2 = round((p2_raw * 100) * self._power_mult + self._power_off)
+        p3 = round((p3_raw * 100) * self._power_mult + self._power_off)
+        self._dbusservice['/L1/Power'] = p1
+        self._dbusservice['/L2/Power'] = p2
+        self._dbusservice['/L3/Power'] = p3
+
+        # Gesamtleistung (W) – nrg[11] in 10W, mit Kalibrierung
+        total_power = round(float(nrg[11]) * 10 * self._power_mult + self._power_off) if len(nrg) > 11 else 0
+        self._dbusservice['/Power'] = total_power
+        self._dbusservice['/Ac/Power'] = total_power
+
+        # Energie (kWh) – eto in 0.1 kWh, mit Kalibrierung
+        eto = _float('eto') / 10.0
+        energy = round(eto * self._energy_mult + self._energy_off, 2)
+        self._dbusservice['/Energy/Forward'] = energy
+        self._dbusservice['/Ac/Energy/Forward'] = energy
+
+        # Ladestrom (A) und Maximalstrom
+        self._dbusservice['/SetCurrent'] = _float('amp')
+        self._dbusservice['/MaxCurrent'] = _float('ama')
+
+        # Status: car als int (1=disconnected, 2=connected, 3=charging, 4=charged, 5=error)
+        car = _int('car')
+        if car == 1:
+            status = 0
+        elif car == 2:
+            status = 1
+        elif car == 3:
+            status = 2
+        elif car == 4:
+            status = 3
+        else:
+            status = 4
+        self._dbusservice['/Status'] = status
+
+        # Ladezeit (nur während des Ladevorgangs)
+        if car == 3:
+            self._chargingTime = _int('dws')
+        else:
+            self._chargingTime = 0
+        self._dbusservice['/ChargingTime'] = self._chargingTime
+
+        logging.debug(f"Update: Power={total_power}W, Current={i1}A, Energy={energy}kWh, Status={status} (car={car})")
+
+    def _handleChangedValue(self, path, value):
+        ip = self._getIP()
+        if path == '/SetCurrent':
+            try:
+                r = requests.get(f"http://{ip}/set?amp={int(value)}", timeout=3)
+                logging.info(f"SetCurrent auf {value}A gesetzt: {r.text}")
+            except Exception as e:
+                logging.error(f"SetCurrent fehlgeschlagen: {e}")
+        elif path == '/MaxCurrent':
+            try:
+                r = requests.get(f"http://{ip}/set?ama={int(value)}", timeout=3)
+                logging.info(f"MaxCurrent auf {value}A gesetzt: {r.text}")
+            except Exception as e:
+                logging.error(f"MaxCurrent fehlgeschlagen: {e}")
+        elif path == '/ChargeMode':
+            logging.info(f"ChargeMode auf {value} gesetzt (noch nicht implementiert)")
         return True
 
-    def _handlechangedvalue(self, path, value):
-        if path == '/SetCurrent':
-            return self._setGoeChargerValue('amp', value)
-        elif path == '/StartStop':
-            return self._setGoeChargerValue('alw', value)
-        elif path == '/MaxCurrent':
-            return self._setGoeChargerValue('ama', value)
-        else:
-            return False
-
+    def _workerThread(self):
+        logging.info("Worker-Thread gestartet")
+        while True:
+            self._fetch_and_update()
+            time.sleep(5)
 
 def main():
-    # configure logging
-    config = configparser.ConfigParser()
-    config.read(os.path.join(os.path.dirname(__file__), 'config.ini'))
-    logging_level = config["DEFAULT"].get("Logging", "DEBUG").upper()
+    import dbus
+    from dbus.mainloop.glib import DBusGMainLoop
+
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    log_dir = os.path.join(script_dir, 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'dbus-goecharger.log')
 
     logging.basicConfig(
-        level=logging_level,
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)-8s %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
             logging.StreamHandler(),
-            logging.handlers.RotatingFileHandler(
-                os.path.dirname(__file__) + '/logs/dbus-goecharger.log',
-                maxBytes=1000000,
-                backupCount=3
-            )
-        ])
+            RotatingFileHandler(log_file, maxBytes=1024*1024, backupCount=3)
+        ]
+    )
 
-    try:
-        logging.info("Start go-eCharger DBus service")
+    logging.info("Start go-eCharger DBus service")
 
-        from dbus.mainloop.glib import DBusGMainLoop
-        DBusGMainLoop(set_as_default=True)
+    DBusGMainLoop(set_as_default=True)
 
-        # formatting lambdas
-        _kwh = lambda p, v: (str(round(v, 2)) + 'kWh')
-        _a   = lambda p, v: (str(round(v, 1)) + 'A')
-        _w   = lambda p, v: (str(round(v, 1)) + 'W')
-        _v   = lambda p, v: (str(round(v, 1)) + 'V')
-        _degC = lambda p, v: (str(v) + '°C')
-        _s   = lambda p, v: (str(v) + 's')
+    config_file = os.path.join(script_dir, 'config.ini')
+    deviceinstance = 43
+    voltage_mult = 1.0
+    voltage_off = 0.0
+    current_mult = 1.0
+    current_off = 0.0
+    power_mult = 1.0
+    power_off = 0.0
+    energy_mult = 1.0
+    energy_off = 0.0
 
-        deviceinstance = int(config["DEFAULT"]["Deviceinstance"])
-        hardwareVersion = int(config["DEFAULT"].get("HardwareVersion", "2"))
+    if os.path.exists(config_file):
+        import configparser
+        cfg = configparser.ConfigParser()
+        cfg.read(config_file)
+        if 'DEFAULT' in cfg:
+            deviceinstance = int(cfg['DEFAULT'].get('Deviceinstance', 43))
+        if 'ONPREMISE' in cfg:
+            # Kalibrierungswerte lesen
+            voltage_mult = float(cfg['ONPREMISE'].get('VoltageMultiplier', 1.0))
+            voltage_off = float(cfg['ONPREMISE'].get('VoltageOffset', 0.0))
+            current_mult = float(cfg['ONPREMISE'].get('CurrentMultiplier', 1.0))
+            current_off = float(cfg['ONPREMISE'].get('CurrentOffset', 0.0))
+            power_mult = float(cfg['ONPREMISE'].get('PowerMultiplier', 1.0))
+            power_off = float(cfg['ONPREMISE'].get('PowerOffset', 0.0))
+            energy_mult = float(cfg['ONPREMISE'].get('EnergyMultiplier', 1.0))
+            energy_off = float(cfg['ONPREMISE'].get('EnergyOffset', 0.0))
+        else:
+            logging.warning("Keine [ONPREMISE] Sektion in config.ini, Kalibrierung deaktiviert")
+    else:
+        logging.warning("Keine config.ini gefunden, Standardwerte für Kalibrierung")
 
-        # start our main-service
-        pvac_output = DbusGoeChargerService(
-            servicename='com.victronenergy.evcharger',
-            paths={
-                '/Current':          {'initial': 0, 'textformat': _a},
-                '/Ac/Power':         {'initial': 0, 'textformat': _w},
-                '/Ac/L1/Power':      {'initial': 0, 'textformat': _w},
-                '/Ac/L2/Power':      {'initial': 0, 'textformat': _w},
-                '/Ac/L3/Power':      {'initial': 0, 'textformat': _w},
-                '/Ac/Voltage':       {'initial': 0, 'textformat': _v},
-                '/Ac/Energy/Forward': {'initial': 0, 'textformat': _kwh},
-                '/UpdateIndex':      {'initial': 0, 'textformat': _s},
-            }
-        )
+    servicename = f'com.victronenergy.evcharger.http_{deviceinstance:03d}'
 
-        mainloop = gobject.MainLoop()
-        mainloop.run()
+    pvac_output = DbusGoeChargerService(
+        servicename=servicename,
+        deviceinstance=deviceinstance,
+        voltage_mult=voltage_mult,
+        voltage_off=voltage_off,
+        current_mult=current_mult,
+        current_off=current_off,
+        power_mult=power_mult,
+        power_off=power_off,
+        energy_mult=energy_mult,
+        energy_off=energy_off
+    )
 
-    except Exception as e:
-        logging.critical('Error at %s', 'main', exc_info=e)
-
+    from gi.repository import GLib
+    mainloop = GLib.MainLoop()
+    mainloop.run()
 
 if __name__ == "__main__":
     main()

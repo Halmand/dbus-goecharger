@@ -49,7 +49,7 @@ After that call the install.sh script.
 
 The following script should do everything for you:
 ```
-wget https://github.com/vikt0rm/dbus-goecharger/archive/refs/heads/main.zip
+wget https://github.com/halmand/dbus-goecharger/archive/refs/heads/main.zip
 unzip main.zip "dbus-goecharger-main/*" -d /data
 mv /data/dbus-goecharger-main /data/dbus-goecharger
 chmod a+x /data/dbus-goecharger/install.sh
